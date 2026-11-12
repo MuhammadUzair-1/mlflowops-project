@@ -1,0 +1,33 @@
+name: MLflowOps - Model Evaluation and Promotion
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install MLflow
+        run: pip install mlflow==2.22.5
+
+      - name: Evaluate model and promote to Staging
+        env:
+          MLFLOW_TRACKING_URI: http://af0ad1a3a2f054ba1b81ae5db45a01c7-1408216736.eu-central-1.elb.amazonaws.com:5000
+        run: python model/evaluate_promote.py
+
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-model-evaluation-report
+          path: evaluation-report.md
+          if-no-files-found: ignore
