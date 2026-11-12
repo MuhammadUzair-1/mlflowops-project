@@ -112,7 +112,7 @@ jobs:
     needs: tests
     timeout-minutes: 50
 
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_training }}
+  
 
     outputs:
       run_id: ${{ steps.launch.outputs.run_id }}
