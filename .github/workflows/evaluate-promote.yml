@@ -1,0 +1,74 @@
+name: MLflowOps - Model Evaluation and Promotion
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install MLflow
+        run: pip install mlflow==2.22.5
+
+      - name: Evaluate and promote model
+        env:
+          MLFLOW_TRACKING_URI: http://af0ad1a3a2f054ba1b81ae5db45a01c7-1408216736.eu-central-1.elb.amazonaws.com:5000
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from mlflow import MlflowClient
+
+          client = MlflowClient()
+          experiment = client.get_experiment_by_name("task-priority-classifier")
+
+          if not experiment:
+              sys.exit("Experiment not found")
+
+          runs = client.search_runs(
+              [experiment.experiment_id],
+              filter_string="attributes.status = 'FINISHED'",
+              order_by=["attributes.start_time DESC"],
+              max_results=1,
+          )
+
+          if not runs:
+              sys.exit("No completed training runs found")
+
+          run = runs[0]
+          m = run.data.metrics
+
+          accuracy = m["accuracy"]
+          f1 = m["f1_macro"]
+          baseline_f1 = m["baseline_f1_macro"]
+
+          print(f"Accuracy: {accuracy:.3f}")
+          print(f"Macro F1: {f1:.3f}")
+          print(f"Baseline F1: {baseline_f1:.3f}")
+
+          if accuracy < 0.80 or f1 < 0.75 or f1 <= baseline_f1:
+              sys.exit("QUALITY GATE FAILED - Model not promoted")
+
+          versions = client.search_model_versions(
+              "name='task-priority-classifier'"
+          )
+
+          matching = [v for v in versions if v.run_id == run.info.run_id]
+
+          if not matching:
+              sys.exit("No registered model version matches this training run")
+
+          version = max(matching, key=lambda v: int(v.version))
+
+          client.transition_model_version_stage(
+              name="task-priority-classifier",
+              version=version.version,
+              stage="Staging",
+              archive_existing_versions=True,
+          )
+
+          print(f"SUCCESS: Model version {version.version} promoted to Staging")
+          PY
