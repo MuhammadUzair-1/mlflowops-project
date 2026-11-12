@@ -128,4 +128,13 @@ jobs:
           echo "Training and MLflow model registration succeeded."
 
       - name: Terminate Spot instance
+        if: always() && steps.launch.outputs.instance_id != ''
+        env:
+          INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
+        shell: bash
+        run: |
+          echo "Terminating Spot instance: ${INSTANCE_ID}"
+          aws ec2 terminate-instances \
+            --region eu-central-1 \
+            --instance-ids "${INSTANCE_ID}"
 
