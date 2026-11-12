@@ -1,0 +1,137 @@
+name: MLflowOps - Spot Model Training
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::686699774218:role/GitHubActionsMLflowOpsRole
+          aws-region: eu-central-1
+
+      - name: Launch EC2 Spot instance
+        id: launch
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          BUCKET="uzair-mlflowops-artifacts-686699774218-eu-central-1"
+
+          cat > /tmp/user-data.sh <<'USERDATA'
+          #!/bin/bash
+          set -Eeuo pipefail
+          exec > >(tee -a /var/log/mlflowops-training.log) 2>&1
+
+          RUN_ID="__RUN_ID__"
+          BUCKET="uzair-mlflowops-artifacts-686699774218-eu-central-1"
+
+          finish() {
+            rc=$?
+            trap - EXIT
+            if [ "$rc" -eq 0 ]; then STATUS="SUCCESS"; else STATUS="FAILED"; fi
+            aws s3 cp /var/log/mlflowops-training.log "s3://${BUCKET}/automation-status/${RUN_ID}/training.log" || true
+            printf '%s\n' "$STATUS" | aws s3 cp - "s3://${BUCKET}/automation-status/${RUN_ID}/status.txt" || true
+            shutdown -h now || true
+            exit "$rc"
+          }
+          trap finish EXIT
+
+          ( sleep 2400; shutdown -h now ) &
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y awscli git python3-pip python3-venv postgresql
+
+          systemctl enable --now postgresql
+          sudo -u postgres psql -c "CREATE USER tasks WITH PASSWORD 'tasks';"
+          sudo -u postgres createdb -O tasks tasks
+          until pg_isready; do sleep 2; done
+
+          python3 -m venv /opt/mlflowops-venv
+          source /opt/mlflowops-venv/bin/activate
+          pip install --upgrade pip
+          pip install mlflow==2.22.5 numpy==2.2.6 pandas scikit-learn==1.7.2 scipy==1.15.3 "sqlalchemy>=2.0,<2.1" psycopg2-binary boto3
+
+          git clone --branch feature/aws-eks-infrastructure --single-branch https://github.com/MuhammadUzair-1/mlflowops-project.git /opt/mlflowops-project
+          cd /opt/mlflowops-project
+
+          export DATABASE_URL="postgresql+psycopg2://tasks:tasks@127.0.0.1:5432/tasks"
+          export MLFLOW_TRACKING_URI="http://af0ad1a3a2f054ba1b81ae5db45a01c7-1408216736.eu-central-1.elb.amazonaws.com:5000"
+
+          echo "=== Generating training data ==="
+          python model/generate_data.py
+          echo "=== Training and registering model ==="
+          python model/train.py
+          echo "=== Training completed ==="
+          USERDATA
+
+          sed -i "s|__RUN_ID__|${RUN_ID}|g" /tmp/user-data.sh
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --region eu-central-1 \
+            --image-id ami-093faf52ba1e451a2 \
+            --instance-type t3.medium \
+            --subnet-id subnet-035d6ddd253e239d0 \
+            --security-group-ids sg-099a9d88495332724 \
+            --iam-instance-profile Name=MLflowOpsSpotProfile \
+            --instance-initiated-shutdown-behavior terminate \
+            --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mlflowops-github-training},{Key=Project,Value=mlflowops}]' \
+            --user-data file:///tmp/user-data.sh \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "Launched Spot instance: ${INSTANCE_ID}"
+
+      - name: Wait for training and retrieve results
+        env:
+          RUN_ID: ${{ steps.launch.outputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUCKET="uzair-mlflowops-artifacts-686699774218-eu-central-1"
+          PREFIX="automation-status/${RUN_ID}"
+          STATUS=""
+
+          for i in $(seq 1 105); do
+            if aws s3api head-object --bucket "$BUCKET" --key "${PREFIX}/status.txt" >/dev/null 2>&1; then
+              STATUS=$(aws s3 cp "s3://${BUCKET}/${PREFIX}/status.txt" -)
+              break
+            fi
+            echo "Training is still running (${i}/105)..."
+            sleep 20
+          done
+
+          aws s3 cp "s3://${BUCKET}/${PREFIX}/training.log" /tmp/training.log || true
+          cat /tmp/training.log || true
+
+          if [ "$STATUS" != "SUCCESS" ]; then
+            echo "Training did not succeed. Status: ${STATUS:-TIMEOUT}"
+            exit 1
+          fi
+
+          echo "Training and MLflow model registration succeeded."
+
+      - name: Terminate Spot instance
+        if: always() && steps.launch.outputs.instance_id != ''
+        env:
+          INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
+        shell: bash
+        run: |
+          echo "Terminating Spot instance: ${INSTANCE_ID}"
+          aws ec2 terminate-instances \
+            --region eu-central-1 \
+            --instance-ids "${INSTANCE_ID}"
