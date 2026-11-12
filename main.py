@@ -1,4 +1,6 @@
 import os
+import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -36,6 +38,9 @@ MODEL_URI = os.getenv(
 
 model = None
 
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger("mlflowops-api")
+
 
 # Prometheus metrics
 PREDICTIONS_TOTAL = Counter(
@@ -43,6 +48,13 @@ PREDICTIONS_TOTAL = Counter(
     "Total number of model predictions",
     ["model_version"],
 )
+
+PREDICTION_ERRORS_TOTAL = Counter(
+    "mlflowops_prediction_errors_total",
+    "Total number of failed model predictions",
+    ["model_version"],
+)
+
 
 PREDICTION_LATENCY = Histogram(
     "mlflowops_prediction_latency_seconds",
@@ -115,32 +127,36 @@ def health():
 # MLflow prediction endpoint
 @app.post("/predict")
 def predict(request: PredictionRequest):
+    start_time = time.perf_counter()
 
     if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="MLflow model is not loaded",
-        )
+        latency = time.perf_counter() - start_time
+        PREDICTION_ERRORS_TOTAL.labels(model_version=MODEL_VERSION).inc()
+        PREDICTION_LATENCY.labels(model_version=MODEL_VERSION).observe(latency)
+        LOGGER.error(json.dumps({
+            "event": "prediction_failed",
+            "model_version": MODEL_VERSION,
+            "reason": "model_not_loaded",
+        }))
+        raise HTTPException(status_code=503, detail="MLflow model is not loaded")
 
     text = f"{request.title} {request.description or ''}".strip()
-
-    start_time = time.perf_counter()
 
     try:
         input_data = pd.DataFrame({"text": [text]})
         prediction = model.predict(input_data)
-
         latency = time.perf_counter() - start_time
-
         priority = str(prediction[0])
 
-        PREDICTIONS_TOTAL.labels(
-            model_version=MODEL_VERSION
-        ).inc()
+        PREDICTIONS_TOTAL.labels(model_version=MODEL_VERSION).inc()
+        PREDICTION_LATENCY.labels(model_version=MODEL_VERSION).observe(latency)
 
-        PREDICTION_LATENCY.labels(
-            model_version=MODEL_VERSION
-        ).observe(latency)
+        LOGGER.info(json.dumps({
+            "event": "prediction_succeeded",
+            "model_version": MODEL_VERSION,
+            "predicted_priority": priority,
+            "latency_seconds": round(latency, 6),
+        }))
 
         return {
             "input": text,
@@ -150,6 +166,17 @@ def predict(request: PredictionRequest):
         }
 
     except Exception as error:
+        latency = time.perf_counter() - start_time
+        PREDICTION_ERRORS_TOTAL.labels(model_version=MODEL_VERSION).inc()
+        PREDICTION_LATENCY.labels(model_version=MODEL_VERSION).observe(latency)
+
+        LOGGER.exception(json.dumps({
+            "event": "prediction_failed",
+            "model_version": MODEL_VERSION,
+            "error": str(error),
+            "latency_seconds": round(latency, 6),
+        }))
+
         raise HTTPException(
             status_code=500,
             detail=f"Prediction failed: {str(error)}",
