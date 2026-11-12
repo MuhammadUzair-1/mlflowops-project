@@ -1,0 +1,415 @@
+name: MLFlowOps - Unified CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      run_training:
+        description: "Run EC2 Spot model training and MLflow evaluation"
+        required: true
+        type: boolean
+        default: false
+
+      deploy:
+        description: "Deploy the evaluated model and API to EKS"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: eu-central-1
+  AWS_ACCOUNT_ID: "686699774218"
+  ECR_REPOSITORY: mlflowops-api
+  EKS_CLUSTER: uzair-mlflowops-eks
+  S3_BUCKET: uzair-mlflowops-artifacts-686699774218-eu-central-1
+  MLFLOW_TRACKING_URI: http://af0ad1a3a2f054ba1b81ae5db45a01c7-1408216736.eu-central-1.elb.amazonaws.com:5000
+
+jobs:
+
+  # --------------------------------------------------
+  # 1. PYTHON TESTS
+  # --------------------------------------------------
+
+  tests:
+    name: "1 - Python Tests"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  # --------------------------------------------------
+  # 2. DOCKER BUILD AND ECR PUSH
+  # --------------------------------------------------
+
+  build_and_push:
+    name: "2 - Docker Build and ECR Push"
+    runs-on: ubuntu-latest
+    needs: tests
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::686699774218:role/GitHubActionsMLflowOpsRole
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+
+          docker build \
+            -t "${ECR_URI}:${IMAGE_TAG}" \
+            -t "${ECR_URI}:latest" \
+            .
+
+      - name: Push Docker image to ECR
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+
+          docker push "${ECR_URI}:${IMAGE_TAG}"
+          docker push "${ECR_URI}:latest"
+
+          echo "Pushed image: ${ECR_URI}:${IMAGE_TAG}"
+
+  # --------------------------------------------------
+  # 3. EC2 SPOT MODEL TRAINING
+  # --------------------------------------------------
+
+  spot_training:
+    name: "3 - EC2 Spot Model Training"
+    runs-on: ubuntu-latest
+    needs: tests
+    timeout-minutes: 50
+
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_training }}
+
+    outputs:
+      run_id: ${{ steps.launch.outputs.run_id }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::686699774218:role/GitHubActionsMLflowOpsRole
+          aws-region: eu-central-1
+
+      - name: Launch EC2 Spot instance
+        id: launch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cat > /tmp/user-data.sh <<'USERDATA'
+          #!/bin/bash
+          set -Eeuo pipefail
+
+          exec > >(tee -a /var/log/mlflowops-training.log) 2>&1
+
+          RUN_ID="__RUN_ID__"
+          BUCKET="uzair-mlflowops-artifacts-686699774218-eu-central-1"
+
+          finish() {
+            rc=$?
+            trap - EXIT
+
+            if [ "$rc" -eq 0 ]; then
+              STATUS="SUCCESS"
+            else
+              STATUS="FAILED"
+            fi
+
+            aws s3 cp /var/log/mlflowops-training.log \
+              "s3://${BUCKET}/automation-status/${RUN_ID}/training.log" || true
+
+            printf '%s\n' "$STATUS" | \
+              aws s3 cp - \
+              "s3://${BUCKET}/automation-status/${RUN_ID}/status.txt" || true
+
+            shutdown -h now || true
+            exit "$rc"
+          }
+
+          trap finish EXIT
+
+          # Safety shutdown after 40 minutes
+          ( sleep 2400; shutdown -h now ) &
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y awscli git python3-pip python3-venv postgresql
+
+          systemctl enable --now postgresql
+
+          sudo -u postgres psql \
+            -c "CREATE USER tasks WITH PASSWORD 'tasks';"
+
+          sudo -u postgres createdb -O tasks tasks
+
+          until pg_isready; do
+            sleep 2
+          done
+
+          python3 -m venv /opt/mlflowops-venv
+          source /opt/mlflowops-venv/bin/activate
+
+          pip install --upgrade pip
+
+          pip install \
+            mlflow==2.22.5 \
+            numpy==2.2.6 \
+            pandas \
+            scikit-learn==1.7.2 \
+            scipy==1.15.3 \
+            "sqlalchemy>=2.0,<2.1" \
+            psycopg2-binary \
+            boto3
+
+          # Use the existing compatible training branch.
+          git clone \
+            --branch feature/aws-eks-infrastructure \
+            --single-branch \
+            https://github.com/MuhammadUzair-1/mlflowops-project.git \
+            /opt/mlflowops-project
+
+          cd /opt/mlflowops-project
+
+          export DATABASE_URL="postgresql+psycopg2://tasks:tasks@127.0.0.1:5432/tasks"
+          export MLFLOW_TRACKING_URI="http://af0ad1a3a2f054ba1b81ae5db45a01c7-1408216736.eu-central-1.elb.amazonaws.com:5000"
+
+          echo "=== Generating training data ==="
+          python model/generate_data.py
+
+          echo "=== Training and registering model ==="
+          python model/train.py
+
+          echo "=== Training completed ==="
+
+          USERDATA
+
+          sed -i "s|__RUN_ID__|${RUN_ID}|g" /tmp/user-data.sh
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --region eu-central-1 \
+            --image-id ami-093faf52ba1e451a2 \
+            --instance-type t3.medium \
+            --subnet-id subnet-035d6ddd253e239d0 \
+            --security-group-ids sg-099a9d88495332724 \
+            --iam-instance-profile Name=MLflowOpsSpotProfile \
+            --instance-initiated-shutdown-behavior terminate \
+            --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mlflowops-github-training},{Key=Project,Value=mlflowops}]' \
+            --user-data file:///tmp/user-data.sh \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+          echo "Launched Spot instance: ${INSTANCE_ID}"
+
+      - name: Wait for training and retrieve results
+        env:
+          RUN_ID: ${{ steps.launch.outputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PREFIX="automation-status/${RUN_ID}"
+          STATUS=""
+
+          for i in $(seq 1 105); do
+
+            if aws s3api head-object \
+              --bucket "$S3_BUCKET" \
+              --key "${PREFIX}/status.txt" >/dev/null 2>&1; then
+
+              STATUS=$(aws s3 cp \
+                "s3://${S3_BUCKET}/${PREFIX}/status.txt" -)
+
+              break
+            fi
+
+            echo "Training is still running (${i}/105)..."
+            sleep 20
+          done
+
+          aws s3 cp \
+            "s3://${S3_BUCKET}/${PREFIX}/training.log" \
+            /tmp/training.log || true
+
+          cat /tmp/training.log || true
+
+          if [ "$STATUS" != "SUCCESS" ]; then
+            echo "Training failed or timed out: ${STATUS:-TIMEOUT}"
+            exit 1
+          fi
+
+          echo "Spot training and MLflow registration succeeded."
+
+      - name: Terminate Spot instance
+        if: always() && steps.launch.outputs.instance_id != ''
+        env:
+          INSTANCE_ID: ${{ steps.launch.outputs.instance_id }}
+        run: |
+          aws ec2 terminate-instances \
+            --region eu-central-1 \
+            --instance-ids "$INSTANCE_ID"
+
+  # --------------------------------------------------
+  # 4. MODEL EVALUATION AND PROMOTION
+  # --------------------------------------------------
+
+  evaluate:
+    name: "4 - Model Evaluation and Promotion"
+    runs-on: ubuntu-latest
+    needs: spot_training
+
+    if: ${{ needs.spot_training.result == 'success' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install MLflow
+        run: pip install mlflow==2.22.5
+
+      - name: Evaluate model and promote to Staging
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+        run: python model/evaluate_promote.py
+
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-model-evaluation-report
+          path: evaluation-report.md
+          if-no-files-found: ignore
+
+  # --------------------------------------------------
+  # 5. DEPLOY TO EKS
+  # --------------------------------------------------
+
+  deploy:
+    name: "5 - Deploy API and Model to EKS"
+    runs-on: ubuntu-latest
+    needs:
+      - build_and_push
+      - evaluate
+
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' &&
+        inputs.run_training &&
+        inputs.deploy &&
+        needs.build_and_push.result == 'success' &&
+        needs.evaluate.result == 'success'
+      }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::686699774218:role/GitHubActionsMLflowOpsRole
+          aws-region: eu-central-1
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Get promoted MLflow model version
+        id: model
+        run: |
+          pip install mlflow==2.22.5
+
+          MODEL_VERSION=$(python - <<'PY'
+          import os
+          from mlflow import MlflowClient
+
+          client = MlflowClient(
+              tracking_uri=os.environ["MLFLOW_TRACKING_URI"]
+          )
+
+          versions = client.get_latest_versions(
+              "task-priority-classifier",
+              stages=["Staging"]
+          )
+
+          if not versions:
+              raise SystemExit("No model version found in Staging")
+
+          print(versions[0].version)
+          PY
+          )
+
+          echo "model_version=${MODEL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Promoted model version: ${MODEL_VERSION}"
+
+      - name: Update API image and model version
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          MODEL_VERSION: ${{ steps.model.outputs.model_version }}
+        run: |
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+
+          kubectl patch deployment mlflowops-api \
+            -n mlflow \
+            --type strategic \
+            -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"api\",\"image\":\"${ECR_URI}:${IMAGE_TAG}\",\"env\":[{\"name\":\"MODEL_VERSION\",\"value\":\"${MODEL_VERSION}\"}]}]}}}}"
+
+      - name: Wait for Kubernetes rollout
+        run: |
+          kubectl rollout status deployment/mlflowops-api \
+            -n mlflow \
+            --timeout=180s
+
+      - name: API health check
+        run: |
+          kubectl exec \
+            -n mlflow \
+            deployment/mlflowops-api \
+            -c api \
+            -- python -c \
+            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10); print('API health check passed')"
