@@ -311,11 +311,12 @@ jobs:
           if-no-files-found: ignore
 
   # --------------------------------------------------
-  # 5. DEPLOY TO EKS
+  # --------------------------------------------------
+  # 5. DEPLOY TO STAGING
   # --------------------------------------------------
 
-  deploy:
-    name: "5 - Deploy API and Model to EKS"
+  deploy_staging:
+    name: "5 - Deploy to Staging"
     runs-on: ubuntu-latest
 
     needs:
@@ -325,6 +326,85 @@ jobs:
     if: |
       needs.build_and_push.result == 'success' &&
       needs.evaluate.result == 'success'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::686699774218:role/GitHubActionsMLflowOpsRole
+          aws-region: eu-central-1
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Apply Kubernetes manifests
+        run: kubectl apply -f terraform/k8s/api-stack.yaml
+
+      - name: Get Staging model version
+        id: model
+        run: |
+          pip install mlflow==2.22.5
+
+          MODEL_VERSION=$(python - <<'PYTHON'
+          import os
+          from mlflow import MlflowClient
+
+          client = MlflowClient(tracking_uri=os.environ["MLFLOW_TRACKING_URI"])
+          versions = client.get_latest_versions(
+              "task-priority-classifier", stages=["Staging"]
+          )
+
+          if not versions:
+              raise SystemExit("No model version found in Staging")
+
+          print(versions[0].version)
+          PYTHON
+          )
+
+          echo "model_version=${MODEL_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Staging API
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          MODEL_VERSION: ${{ steps.model.outputs.model_version }}
+        run: |
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+
+          kubectl set image deployment/mlflowops-api \
+            api="${ECR_URI}:${IMAGE_TAG}" -n mlflow
+
+          kubectl set env deployment/mlflowops-api \
+            MODEL_VERSION="${MODEL_VERSION}" -n mlflow
+
+      - name: Wait for Staging rollout
+        run: |
+          kubectl rollout status deployment/mlflowops-api \
+            -n mlflow --timeout=240s
+
+      - name: Staging API health check
+        run: |
+          kubectl exec -n mlflow deployment/mlflowops-api -c api -- \
+            python -c \
+            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10); print('Staging health check passed')"
+
+  # --------------------------------------------------
+  # 6. MANUAL PRODUCTION APPROVAL AND DEPLOYMENT
+  # --------------------------------------------------
+
+  deploy_production:
+    name: "6 - Approve and Deploy to Production"
+    runs-on: ubuntu-latest
+    needs: deploy_staging
+    environment:
+      name: production
+
+    if: needs.deploy_staging.result == 'success'
 
     steps:
       - name: Configure AWS credentials
@@ -339,57 +419,59 @@ jobs:
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER"
 
-      - name: Get promoted MLflow model version
+      - name: Promote approved model to Production
         id: model
         run: |
           pip install mlflow==2.22.5
 
-          MODEL_VERSION=$(python - <<'PY'
+          MODEL_VERSION=$(python - <<'PYTHON'
           import os
           from mlflow import MlflowClient
 
-          client = MlflowClient(
-              tracking_uri=os.environ["MLFLOW_TRACKING_URI"]
-          )
-
+          client = MlflowClient(tracking_uri=os.environ["MLFLOW_TRACKING_URI"])
           versions = client.get_latest_versions(
-              "task-priority-classifier",
-              stages=["Staging"]
+              "task-priority-classifier", stages=["Staging"]
           )
 
           if not versions:
-              raise SystemExit("No model version found in Staging")
+              raise SystemExit("No model version available in Staging")
 
-          print(versions[0].version)
-          PY
+          version = versions[0].version
+
+          client.transition_model_version_stage(
+              name="task-priority-classifier",
+              version=version,
+              stage="Production",
+              archive_existing_versions=True,
+          )
+
+          print(version)
+          PYTHON
           )
 
           echo "model_version=${MODEL_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Promoted model version: ${MODEL_VERSION}"
+          echo "Approved Production model version: ${MODEL_VERSION}"
 
-      - name: Update API image and model version
+      - name: Deploy Production API
         env:
           IMAGE_TAG: ${{ github.sha }}
           MODEL_VERSION: ${{ steps.model.outputs.model_version }}
         run: |
           ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
 
-          kubectl patch deployment mlflowops-api \
-            -n mlflow \
-            --type strategic \
-            -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"api\",\"image\":\"${ECR_URI}:${IMAGE_TAG}\",\"env\":[{\"name\":\"MODEL_VERSION\",\"value\":\"${MODEL_VERSION}\"}]}]}}}}"
+          kubectl set image deployment/mlflowops-api-production \
+            api="${ECR_URI}:${IMAGE_TAG}" -n mlflow
 
-      - name: Wait for Kubernetes rollout
-        run: |
-          kubectl rollout status deployment/mlflowops-api \
-            -n mlflow \
-            --timeout=180s
+          kubectl set env deployment/mlflowops-api-production \
+            MODEL_VERSION="${MODEL_VERSION}" -n mlflow
 
-      - name: API health check
+      - name: Wait for Production rollout
         run: |
-          kubectl exec \
-            -n mlflow \
-            deployment/mlflowops-api \
-            -c api \
-            -- python -c \
-            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10); print('API health check passed')"
+          kubectl rollout status deployment/mlflowops-api-production \
+            -n mlflow --timeout=240s
+
+      - name: Production API health check
+        run: |
+          kubectl exec -n mlflow deployment/mlflowops-api-production -c api -- \
+            python -c \
+            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10); print('Production health check passed')"

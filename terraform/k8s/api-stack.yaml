@@ -1,0 +1,247 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tasks-postgres-pvc
+  namespace: mlflow
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasks-postgres
+  namespace: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tasks-postgres
+  template:
+    metadata:
+      labels:
+        app: tasks-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_USER
+              value: tasks
+            - name: POSTGRES_PASSWORD
+              value: tasks
+            - name: POSTGRES_DB
+              value: tasks
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "tasks", "-d", "tasks"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tasks-postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasks-postgres
+  namespace: mlflow
+spec:
+  selector:
+    app: tasks-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasks-redis
+  namespace: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tasks-redis
+  template:
+    metadata:
+      labels:
+        app: tasks-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasks-redis
+  namespace: mlflow
+spec:
+  selector:
+    app: tasks-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflowops-api
+  namespace: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflowops-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mlflowops-api
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - until pg_isready -h tasks-postgres -U tasks -d tasks; do sleep 3; done
+      containers:
+        - name: api
+          image: 686699774218.dkr.ecr.eu-central-1.amazonaws.com/mlflowops-api:v2
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: postgresql+psycopg2://tasks:tasks@tasks-postgres:5432/tasks
+            - name: REDIS_URL
+              value: redis://tasks-redis:6379/0
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow:5000
+            - name: MODEL_VERSION
+              value: "2"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflowops-api
+  namespace: mlflow
+spec:
+  type: ClusterIP
+  selector:
+    app: mlflowops-api
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflowops-api-production
+  namespace: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflowops-api-production
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mlflowops-api-production
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - until pg_isready -h tasks-postgres -U tasks -d tasks; do sleep 3; done
+      containers:
+        - name: api
+          image: 686699774218.dkr.ecr.eu-central-1.amazonaws.com/mlflowops-api:v2
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: postgresql+psycopg2://tasks:tasks@tasks-postgres:5432/tasks
+            - name: REDIS_URL
+              value: redis://tasks-redis:6379/0
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow:5000
+            - name: MODEL_VERSION
+              value: "2"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflowops-api-production
+  namespace: mlflow
+spec:
+  type: ClusterIP
+  selector:
+    app: mlflowops-api-production
+  ports:
+    - port: 8000
+      targetPort: 8000
