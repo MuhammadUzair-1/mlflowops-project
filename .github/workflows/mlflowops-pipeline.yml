@@ -1,4 +1,4 @@
-name: MLFlowOps - Unified CI/CD Pipeline
+name: MLflowOps - Unified CI/CD Pipeline
 
 on:
   push:
@@ -6,18 +6,6 @@ on:
       - main
 
   workflow_dispatch:
-    inputs:
-      run_training:
-        description: "Run EC2 Spot model training and MLflow evaluation"
-        required: true
-        type: boolean
-        default: false
-
-      deploy:
-        description: "Deploy the evaluated model and API to EKS"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -111,8 +99,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: tests
     timeout-minutes: 50
-
-  
 
     outputs:
       run_id: ${{ steps.launch.outputs.run_id }}
@@ -299,8 +285,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: spot_training
 
-    if: ${{ needs.spot_training.result == 'success' }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -314,9 +298,9 @@ jobs:
         run: pip install mlflow==2.22.5
 
       - name: Evaluate model and promote to Staging
+        run: python model/evaluate_promote.py
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
-        run: python model/evaluate_promote.py
 
       - name: Upload evaluation report
         if: always()
@@ -333,18 +317,14 @@ jobs:
   deploy:
     name: "5 - Deploy API and Model to EKS"
     runs-on: ubuntu-latest
+
     needs:
       - build_and_push
       - evaluate
 
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' &&
-        inputs.run_training &&
-        inputs.deploy &&
-        needs.build_and_push.result == 'success' &&
-        needs.evaluate.result == 'success'
-      }}
+    if: |
+      needs.build_and_push.result == 'success' &&
+      needs.evaluate.result == 'success'
 
     steps:
       - name: Configure AWS credentials
